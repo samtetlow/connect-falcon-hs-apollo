@@ -2,9 +2,13 @@
 FalconHub - Connect Falcon-HubSpot
 Clean FastAPI application for Falcon and HubSpot integration
 With Event-Driven Synchronization Support
+
+Supports both local development (SQLite + APScheduler) and
+Vercel deployment (PostgreSQL + Cron Jobs)
 """
 
-from fastapi import FastAPI, Request, BackgroundTasks
+import os
+from fastapi import FastAPI, Request, BackgroundTasks, Header
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,15 +23,21 @@ from typing import Optional, Dict, Any
 from wrike_client import WrikeClient
 from hubspot_client import HubSpotClient
 
-# APScheduler for background job scheduling
-try:
-    from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    from apscheduler.triggers.interval import IntervalTrigger
-    from apscheduler.triggers.cron import CronTrigger
-    SCHEDULER_AVAILABLE = True
-except ImportError:
-    SCHEDULER_AVAILABLE = False
-    logging.warning("APScheduler not installed. Background sync disabled.")
+# Check if running on Vercel
+IS_VERCEL = os.environ.get('VERCEL') == '1' or os.environ.get('POSTGRES_URL') is not None
+
+# APScheduler for background job scheduling (only used locally, not on Vercel)
+SCHEDULER_AVAILABLE = False
+if not IS_VERCEL:
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
+        from apscheduler.triggers.cron import CronTrigger
+        SCHEDULER_AVAILABLE = True
+    except ImportError:
+        logging.warning("APScheduler not installed. Background sync disabled.")
+else:
+    logging.info("Running on Vercel - using Cron Jobs instead of APScheduler")
 
 # Configure logging
 logging.basicConfig(
@@ -37,7 +47,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 try:
-    from sync_engine import EnhancedSyncEngine, EnhancedDB, EnhancedHubSpotClient, EnhancedWrikeClient, load_config as load_sync_config
+    from sync_engine import EnhancedSyncEngine, EnhancedHubSpotClient, EnhancedWrikeClient, load_config as load_sync_config
+    from database import EnhancedDB
     SYNC_ENGINE_AVAILABLE = True
 except ImportError as e:
     SYNC_ENGINE_AVAILABLE = False
@@ -54,6 +65,7 @@ sync_config = None  # Configuration loaded from config.yaml
 # Scheduler state tracking
 scheduler_state = {
     "enabled": False,
+    "mode": "vercel_cron" if IS_VERCEL else "apscheduler",
     "change_detection_interval_minutes": 2,
     "reconciliation_hour": 0,
     "last_change_detection": None,
@@ -62,16 +74,44 @@ scheduler_state = {
     "next_reconciliation": None,
     "change_detections_run": 0,
     "reconciliations_run": 0,
-    "webhooks_enabled": False
+    "webhooks_enabled": IS_VERCEL  # Enable webhooks by default on Vercel
 }
 
 def load_config():
-    """Load configuration from config.json"""
+    """
+    Load configuration from environment variables (Vercel) or config.json (local).
+    Environment variables take precedence.
+    """
+    config = {}
+    
+    # Try loading from environment variables first (for Vercel)
+    wrike_token = os.environ.get('WRIKE_API_TOKEN')
+    hubspot_token = os.environ.get('HUBSPOT_ACCESS_TOKEN') or os.environ.get('HUBSPOT_API_KEY')
+    
+    if wrike_token:
+        config['wrike'] = {'api_token': wrike_token}
+        logger.info("✓ Loaded Wrike token from environment")
+    
+    if hubspot_token:
+        config['hubspot'] = {'access_token': hubspot_token}
+        logger.info("✓ Loaded HubSpot token from environment")
+    
+    # Fall back to config.json for local development
     config_path = Path(__file__).parent / "config.json"
     if config_path.exists():
         with open(config_path, 'r') as f:
-            return json.load(f)
-    return {}
+            file_config = json.load(f)
+            # Merge file config with env config (env takes precedence)
+            for key, value in file_config.items():
+                if key not in config:
+                    config[key] = value
+                elif isinstance(value, dict) and isinstance(config.get(key), dict):
+                    # Merge nested dicts
+                    for k, v in value.items():
+                        if k not in config[key]:
+                            config[key][k] = v
+    
+    return config
 
 async def run_change_detection():
     """Background job: Detect changes in Wrike and HubSpot and sync them"""
@@ -923,6 +963,125 @@ async def hubspot_webhook(request: Request, background_tasks: BackgroundTasks):
             status_code=500,
             content={"status": "error", "message": str(e)}
         )
+
+# ============================================
+# VERCEL CRON JOB ENDPOINTS
+# These are called by Vercel's cron scheduler instead of APScheduler
+# ============================================
+
+@app.get("/api/cron/change-detection")
+async def cron_change_detection(authorization: Optional[str] = Header(None)):
+    """
+    Cron endpoint for change detection (called by Vercel every 2 minutes).
+    Secured by CRON_SECRET environment variable.
+    """
+    global sync_engine
+    
+    # Verify the request is from Vercel Cron (in production)
+    cron_secret = os.environ.get('CRON_SECRET')
+    if cron_secret and authorization != f"Bearer {cron_secret}":
+        logger.warning("Unauthorized cron request attempted")
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "message": "Unauthorized"}
+        )
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        logger.info("🔄 Cron: Running change detection...")
+        
+        # Run change detection
+        results = sync_engine.detect_and_sync_changes()
+        
+        logger.info(f"✓ Cron: Change detection complete: {results}")
+        return {
+            "status": "success",
+            "message": "Change detection completed",
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron change detection failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/cron/reconciliation")
+async def cron_reconciliation(authorization: Optional[str] = Header(None)):
+    """
+    Cron endpoint for daily reconciliation (called by Vercel at midnight).
+    Secured by CRON_SECRET environment variable.
+    """
+    global sync_engine
+    
+    # Verify the request is from Vercel Cron (in production)
+    cron_secret = os.environ.get('CRON_SECRET')
+    if cron_secret and authorization != f"Bearer {cron_secret}":
+        logger.warning("Unauthorized cron request attempted")
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "message": "Unauthorized"}
+        )
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        logger.info("📊 Cron: Running daily reconciliation...")
+        
+        # Run reconciliation
+        results = sync_engine.daily_reconciliation()
+        
+        logger.info(f"✓ Cron: Reconciliation complete")
+        return {
+            "status": "success",
+            "message": "Reconciliation completed",
+            "results": {
+                "wrike_total": results.get("wrike_total", 0),
+                "hubspot_total": results.get("hubspot_total", 0),
+                "matched": results.get("matched", 0),
+                "mismatched": results.get("mismatched", 0),
+                "status": results.get("status", "unknown")
+            }
+        }
+    except Exception as e:
+        logger.error(f"Cron reconciliation failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/cron/full-sync")
+async def cron_full_sync(authorization: Optional[str] = Header(None)):
+    """
+    Cron endpoint for running a full sync (optional, can be scheduled if needed).
+    Secured by CRON_SECRET environment variable.
+    """
+    global sync_engine
+    
+    # Verify the request is from Vercel Cron (in production)
+    cron_secret = os.environ.get('CRON_SECRET')
+    if cron_secret and authorization != f"Bearer {cron_secret}":
+        logger.warning("Unauthorized cron request attempted")
+        return JSONResponse(
+            status_code=401,
+            content={"status": "error", "message": "Unauthorized"}
+        )
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        logger.info("🚀 Cron: Running full sync...")
+        
+        # Run full sync
+        results = sync_engine.sync_once()
+        
+        logger.info(f"✓ Cron: Full sync complete")
+        return {
+            "status": "success",
+            "message": "Full sync completed",
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron full sync failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 # Create a simple startup script
 def start_server():
