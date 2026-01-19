@@ -1,6 +1,6 @@
 """
 Vercel Serverless Entry Point for FalconHub
-This file serves as the entry point for Vercel's serverless functions.
+Uses Mangum to adapt FastAPI (ASGI) for serverless environments.
 """
 
 import sys
@@ -12,6 +12,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Import the FastAPI app
 from app import app
 
-# Vercel expects the handler to be named 'app' or 'handler'
-handler = app
+# Use Mangum to wrap FastAPI for serverless (AWS Lambda / Vercel)
+from mangum import Mangum
+
+# Create the handler that Vercel will use
+handler = Mangum(app, lifespan="off")
 
