@@ -298,9 +298,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Static files
+# Static files (only mount if directory exists)
 static_path = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
+if static_path.exists():
+    app.mount("/static", StaticFiles(directory=str(static_path)), name="static")
+else:
+    logger.warning(f"Static directory not found: {static_path}")
 
 # Pydantic models
 class HealthResponse(BaseModel):
@@ -312,7 +315,9 @@ class HealthResponse(BaseModel):
 async def dashboard():
     """Beautiful FalconHub dashboard"""
     try:
-        with open("dashboard.html", "r", encoding="utf-8") as f:
+        # Use absolute path relative to this file (works on both local and Vercel)
+        dashboard_path = Path(__file__).parent / "dashboard.html"
+        with open(dashboard_path, "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
         return "<h1>FalconHub Dashboard</h1><p>Dashboard file not found. Please check dashboard.html</p>"
@@ -641,16 +646,39 @@ async def get_issues():
 @app.get("/api/reconciliation/report")
 async def get_report():
     """Export and download reconciliation report"""
+    from fastapi.responses import StreamingResponse
+    import io
+    import csv
+    
     global sync_engine
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not available"}
     
     try:
-        report_path = sync_engine.export_reconciliation_report()
-        return FileResponse(
-            path=report_path,
-            filename="reconciliation_report.csv",
-            media_type="text/csv"
+        # Generate CSV in memory (works on Vercel's read-only filesystem)
+        report = sync_engine.db.get_last_reconciliation_report()
+        if not report:
+            return {"status": "error", "message": "No reconciliation report available"}
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Reconciliation Report"])
+        writer.writerow([f"Run At: {report.get('run_at', 'N/A')}"])
+        writer.writerow([])
+        writer.writerow(["Metric", "Value"])
+        writer.writerow(["Wrike Total", report.get("wrike_total", 0)])
+        writer.writerow(["HubSpot Total", report.get("hubspot_total", 0)])
+        writer.writerow(["Matched", report.get("matched", 0)])
+        writer.writerow(["Wrike Only", report.get("wrike_only", 0)])
+        writer.writerow(["HubSpot Only", report.get("hubspot_only", 0)])
+        writer.writerow(["Mismatched", report.get("mismatched", 0)])
+        writer.writerow(["Auto Fixed", report.get("auto_fixed", 0)])
+        
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=reconciliation_report.csv"}
         )
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -745,16 +773,47 @@ async def get_activity_details(activity_id: int):
 @app.get("/api/activities/{activity_id}/report")
 async def download_activity_report(activity_id: int):
     """Download CSV report for a specific activity"""
+    from fastapi.responses import StreamingResponse
+    import io
+    import csv
+    
     global sync_engine
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
     try:
-        report_path = sync_engine.db.export_activity_report(activity_id)
-        return FileResponse(
-            path=report_path,
-            filename=f"activity_report_{activity_id}.csv",
-            media_type="text/csv"
+        # Generate CSV in memory (works on Vercel's read-only filesystem)
+        changes = sync_engine.db.get_activity_changes(activity_id)
+        activity = sync_engine.db.fetchone(
+            "SELECT activity_type, started_at FROM sync_activities WHERE id = ?",
+            (activity_id,)
+        )
+        
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        if activity:
+            writer.writerow([f"Activity Report: {activity[0]}"])
+            writer.writerow([f"Started: {activity[1]}"])
+            writer.writerow([])
+        
+        headers = ["Company Name", "Wrike Company ID", "HubSpot Company ID",
+                   "Entity Type", "Field Name", "System Changed",
+                   "Original Value", "New Value", "Changed (Y/N)"]
+        writer.writerow(headers)
+        
+        for c in changes:
+            writer.writerow([
+                c["company_name"], c["wrike_company_id"], c["hubspot_company_id"],
+                c["entity_type"], c["field_name"], c["system_changed"],
+                c["old_value"], c["new_value"], "Y" if c["changed"] else "N"
+            ])
+        
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=activity_report_{activity_id}.csv"}
         )
     except Exception as e:
         logger.error(f"Failed to generate activity report: {e}")
