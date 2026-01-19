@@ -975,6 +975,50 @@
                         <span class="metric-value status-success" id="sync-uptime">0m 0s</span>
                     </div>
                 </div>
+
+                <!-- Event-Driven Sync Scheduler Card -->
+                <div class="card">
+                    <div class="card-header">
+                        <div class="card-icon" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="10"></circle>
+                                <polyline points="12 6 12 12 16 14"></polyline>
+                            </svg>
+                        </div>
+                        <h3 class="card-title">Auto-Sync Scheduler</h3>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Scheduler Status</span>
+                        <span class="metric-value" id="scheduler-status">
+                            <span class="status-dot status-dot-warning"></span>
+                            Loading...
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Change Detection</span>
+                        <span class="metric-value" id="scheduler-interval">Every 2 min</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Next Change Check</span>
+                        <span class="metric-value status-dim" id="scheduler-next-change">—</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Next Daily Reconcile</span>
+                        <span class="metric-value status-dim" id="scheduler-next-reconcile">—</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Runs Today</span>
+                        <span class="metric-value" id="scheduler-runs">0 changes / 0 reconcile</span>
+                    </div>
+                    <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
+                        <button class="test-sync-btn" onclick="toggleScheduler()" id="scheduler-toggle-btn" style="flex: 1;">
+                            <i class="fas fa-pause"></i> Pause
+                        </button>
+                        <button class="test-sync-btn" onclick="triggerChangeDetection()" style="flex: 1;">
+                            <i class="fas fa-bolt"></i> Run Now
+                        </button>
+                    </div>
+                </div>
             </div>
 
             <section class="actions-section">
@@ -1801,11 +1845,159 @@
         `;
         document.head.appendChild(style);
 
+        // ============================================
+        // SCHEDULER STATUS FUNCTIONS
+        // ============================================
+
+        let schedulerRunning = true;
+
+        async function fetchSchedulerStatus() {
+            try {
+                const res = await fetch('/api/scheduler/status');
+                const data = await res.json();
+                
+                if (data.status === 'success') {
+                    updateSchedulerUI(data.scheduler);
+                }
+            } catch (err) {
+                console.error('Failed to fetch scheduler status:', err);
+                // Set scheduler as offline
+                const statusEl = document.getElementById('scheduler-status');
+                if (statusEl) {
+                    statusEl.innerHTML = '<span class="status-dot status-dot-error"></span> Offline';
+                    statusEl.classList.remove('status-success', 'status-warning');
+                    statusEl.classList.add('status-error');
+                }
+            }
+        }
+
+        function updateSchedulerUI(scheduler) {
+            // Update scheduler status
+            const statusEl = document.getElementById('scheduler-status');
+            if (statusEl) {
+                if (scheduler.running && scheduler.enabled) {
+                    statusEl.innerHTML = '<span class="status-dot status-dot-success"></span> Running';
+                    statusEl.classList.remove('status-warning', 'status-error');
+                    statusEl.classList.add('status-success');
+                    schedulerRunning = true;
+                } else if (scheduler.running && !scheduler.enabled) {
+                    statusEl.innerHTML = '<span class="status-dot status-dot-warning"></span> Paused';
+                    statusEl.classList.remove('status-success', 'status-error');
+                    statusEl.classList.add('status-warning');
+                    schedulerRunning = false;
+                } else {
+                    statusEl.innerHTML = '<span class="status-dot status-dot-error"></span> Stopped';
+                    statusEl.classList.remove('status-success', 'status-warning');
+                    statusEl.classList.add('status-error');
+                    schedulerRunning = false;
+                }
+            }
+
+            // Update interval
+            const intervalEl = document.getElementById('scheduler-interval');
+            if (intervalEl) {
+                intervalEl.textContent = `Every ${scheduler.change_detection_interval_minutes} min`;
+            }
+
+            // Update next change check
+            const nextChangeEl = document.getElementById('scheduler-next-change');
+            if (nextChangeEl && scheduler.next_change_detection) {
+                const nextDate = new Date(scheduler.next_change_detection);
+                const now = new Date();
+                const diffMs = nextDate - now;
+                if (diffMs > 0) {
+                    const diffMin = Math.floor(diffMs / 60000);
+                    const diffSec = Math.floor((diffMs % 60000) / 1000);
+                    nextChangeEl.textContent = diffMin > 0 ? `in ${diffMin}m ${diffSec}s` : `in ${diffSec}s`;
+                } else {
+                    nextChangeEl.textContent = 'Running...';
+                }
+            } else if (nextChangeEl) {
+                nextChangeEl.textContent = '—';
+            }
+
+            // Update next reconciliation
+            const nextReconcileEl = document.getElementById('scheduler-next-reconcile');
+            if (nextReconcileEl && scheduler.next_reconciliation) {
+                const nextDate = new Date(scheduler.next_reconciliation);
+                nextReconcileEl.textContent = nextDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            } else if (nextReconcileEl) {
+                nextReconcileEl.textContent = `at ${scheduler.reconciliation_hour || 0}:00`;
+            }
+
+            // Update runs count
+            const runsEl = document.getElementById('scheduler-runs');
+            if (runsEl) {
+                runsEl.textContent = `${scheduler.change_detections_run || 0} changes / ${scheduler.reconciliations_run || 0} reconcile`;
+            }
+
+            // Update toggle button
+            const toggleBtn = document.getElementById('scheduler-toggle-btn');
+            if (toggleBtn) {
+                if (schedulerRunning) {
+                    toggleBtn.innerHTML = '<i class="fas fa-pause"></i> Pause';
+                } else {
+                    toggleBtn.innerHTML = '<i class="fas fa-play"></i> Resume';
+                }
+            }
+        }
+
+        async function toggleScheduler() {
+            try {
+                const endpoint = schedulerRunning ? '/api/scheduler/pause' : '/api/scheduler/resume';
+                const res = await fetch(endpoint, { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.status === 'success') {
+                    showAlert(data.message);
+                    addLogEntry('INFO', data.message);
+                    fetchSchedulerStatus();
+                } else {
+                    showAlert('Failed: ' + data.message);
+                }
+            } catch (err) {
+                showAlert('Failed to toggle scheduler');
+            }
+        }
+
+        async function triggerChangeDetection() {
+            try {
+                showAlert('🔄 Running change detection...');
+                const res = await fetch('/api/scheduler/trigger-change-detection', { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.status === 'success') {
+                    addLogEntry('INFO', 'Change detection triggered manually');
+                } else {
+                    showAlert('Failed: ' + data.message);
+                }
+            } catch (err) {
+                showAlert('Failed to trigger change detection');
+            }
+        }
+
+        async function triggerReconciliation() {
+            try {
+                showAlert('📊 Running daily reconciliation...');
+                const res = await fetch('/api/scheduler/trigger-reconciliation', { method: 'POST' });
+                const data = await res.json();
+                
+                if (data.status === 'success') {
+                    addLogEntry('INFO', 'Reconciliation triggered manually');
+                } else {
+                    showAlert('Failed: ' + data.message);
+                }
+            } catch (err) {
+                showAlert('Failed to trigger reconciliation');
+            }
+        }
+
         // Initialize dashboard
         document.addEventListener('DOMContentLoaded', () => {
             console.log('🦅 FalconHub Dashboard loaded successfully');
             addLogEntry('INFO', 'FalconHub Dashboard initialized - Systems Standby');
             fetchStatus();
+            fetchSchedulerStatus();
             fetchFieldMappings();
             loadActivityHistory();
             updateUptime();
@@ -1813,6 +2005,8 @@
             setInterval(fetchStatus, 30000);
             // Refresh activity history every 60 seconds
             setInterval(loadActivityHistory, 60000);
+            // Update scheduler status every 10 seconds (more frequent for countdown)
+            setInterval(fetchSchedulerStatus, 10000);
             // Update uptime every second
             setInterval(updateUptime, 1000);
         });

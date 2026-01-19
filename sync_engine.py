@@ -11,6 +11,7 @@ import os
 import sqlite3
 import sys
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -19,6 +20,14 @@ import logging
 import requests
 import yaml
 from dateutil import parser as dtparser
+
+# Global sync lock to prevent concurrent syncs
+_sync_lock = threading.Lock()
+_sync_in_progress = False
+
+def is_sync_in_progress() -> bool:
+    """Check if a sync is currently running"""
+    return _sync_in_progress
 
 # Import our clients
 from wrike_client import WrikeClient
@@ -395,6 +404,49 @@ class EnhancedDB:
             )
         """)
 
+        # Change tracking for event-driven sync
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS change_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                record_name TEXT,
+                change_type TEXT,
+                detected_at TEXT NOT NULL,
+                synced_at TEXT,
+                status TEXT DEFAULT 'pending',
+                error_message TEXT,
+                UNIQUE(source, record_id, detected_at)
+            )
+        """)
+        
+        # Create index for faster lookups
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_change_tracking_status 
+            ON change_tracking(status)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_change_tracking_source_record 
+            ON change_tracking(source, record_id)
+        """)
+
+        # Daily reconciliation reports
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reconciliation_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_at TEXT NOT NULL,
+                wrike_total INTEGER DEFAULT 0,
+                hubspot_total INTEGER DEFAULT 0,
+                matched INTEGER DEFAULT 0,
+                wrike_only INTEGER DEFAULT 0,
+                hubspot_only INTEGER DEFAULT 0,
+                mismatched INTEGER DEFAULT 0,
+                auto_fixed INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'completed',
+                details TEXT
+            )
+        """)
+
         self.conn.commit()
 
     def log_sync_operation(self, operation: str, source: str, target: str,
@@ -612,6 +664,158 @@ class EnhancedDB:
             ]
         }
 
+    # ============================================
+    # CHANGE TRACKING METHODS (Event-Driven Sync)
+    # ============================================
+
+    def track_change(self, source: str, record_id: str, record_name: str = "",
+                    change_type: str = "update") -> int:
+        """Record a detected change for later processing"""
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            cur = self.conn.execute("""
+                INSERT INTO change_tracking(source, record_id, record_name, change_type, detected_at, status)
+                VALUES(?, ?, ?, ?, ?, 'pending')
+            """, (source, record_id, record_name, change_type, now))
+            self.conn.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            # Already tracked this change
+            return 0
+
+    def get_pending_changes(self, limit: int = 100) -> List[Dict]:
+        """Get pending changes that need to be synced"""
+        rows = self.conn.execute("""
+            SELECT id, source, record_id, record_name, change_type, detected_at
+            FROM change_tracking
+            WHERE status = 'pending'
+            ORDER BY detected_at ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        
+        return [{
+            "id": r[0], "source": r[1], "record_id": r[2],
+            "record_name": r[3], "change_type": r[4], "detected_at": r[5]
+        } for r in rows]
+
+    def mark_change_synced(self, change_id: int) -> None:
+        """Mark a change as successfully synced"""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute("""
+            UPDATE change_tracking
+            SET status = 'synced', synced_at = ?
+            WHERE id = ?
+        """, (now, change_id))
+        self.conn.commit()
+
+    def mark_change_failed(self, change_id: int, error: str) -> None:
+        """Mark a change as failed with error message"""
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.execute("""
+            UPDATE change_tracking
+            SET status = 'failed', synced_at = ?, error_message = ?
+            WHERE id = ?
+        """, (now, error, change_id))
+        self.conn.commit()
+
+    def get_change_stats(self) -> Dict:
+        """Get statistics about change tracking"""
+        rows = self.conn.execute("""
+            SELECT status, COUNT(*) as count
+            FROM change_tracking
+            GROUP BY status
+        """).fetchall()
+        
+        stats = {"pending": 0, "synced": 0, "failed": 0}
+        for r in rows:
+            stats[r[0]] = r[1]
+        
+        # Get last 24 hours activity
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        recent = self.conn.execute("""
+            SELECT COUNT(*) FROM change_tracking
+            WHERE detected_at > ?
+        """, (yesterday,)).fetchone()
+        
+        stats["changes_last_24h"] = recent[0] if recent else 0
+        return stats
+
+    def cleanup_old_changes(self, days: int = 30) -> int:
+        """Remove old synced/failed changes"""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur = self.conn.execute("""
+            DELETE FROM change_tracking
+            WHERE status IN ('synced', 'failed') AND detected_at < ?
+        """, (cutoff,))
+        self.conn.commit()
+        return cur.rowcount
+
+    # ============================================
+    # RECONCILIATION REPORT METHODS
+    # ============================================
+
+    def save_reconciliation_report(self, report: Dict) -> int:
+        """Save a reconciliation report"""
+        cur = self.conn.execute("""
+            INSERT INTO reconciliation_reports(
+                run_at, wrike_total, hubspot_total, matched,
+                wrike_only, hubspot_only, mismatched, auto_fixed,
+                status, details
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            report.get("wrike_total", 0),
+            report.get("hubspot_total", 0),
+            report.get("matched", 0),
+            report.get("wrike_only", 0),
+            report.get("hubspot_only", 0),
+            report.get("mismatched", 0),
+            report.get("auto_fixed", 0),
+            report.get("status", "completed"),
+            json.dumps(report.get("details", {}))
+        ))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_last_reconciliation_report(self) -> Optional[Dict]:
+        """Get the most recent reconciliation report"""
+        row = self.conn.execute("""
+            SELECT id, run_at, wrike_total, hubspot_total, matched,
+                   wrike_only, hubspot_only, mismatched, auto_fixed,
+                   status, details
+            FROM reconciliation_reports
+            ORDER BY id DESC
+            LIMIT 1
+        """).fetchone()
+        
+        if not row:
+            return None
+        
+        return {
+            "id": row[0], "run_at": row[1], "wrike_total": row[2],
+            "hubspot_total": row[3], "matched": row[4],
+            "wrike_only": row[5], "hubspot_only": row[6],
+            "mismatched": row[7], "auto_fixed": row[8],
+            "status": row[9], "details": json.loads(row[10]) if row[10] else {}
+        }
+
+    def list_reconciliation_reports(self, limit: int = 10) -> List[Dict]:
+        """List recent reconciliation reports"""
+        rows = self.conn.execute("""
+            SELECT id, run_at, wrike_total, hubspot_total, matched,
+                   wrike_only, hubspot_only, mismatched, auto_fixed, status
+            FROM reconciliation_reports
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        
+        return [{
+            "id": r[0], "run_at": r[1], "wrike_total": r[2],
+            "hubspot_total": r[3], "matched": r[4],
+            "wrike_only": r[5], "hubspot_only": r[6],
+            "mismatched": r[7], "auto_fixed": r[8], "status": r[9]
+        } for r in rows]
+
 # --- Data Models ---
 @dataclass
 class Company:
@@ -779,6 +983,13 @@ class EnhancedHubSpotClient:
 
                 if response.status_code >= 400:
                     logger.error(f"HubSpot error {response.status_code}: {response.text}")
+                    
+                    # Don't retry on 4xx client errors (except 429 rate limit)
+                    # 404 = Not Found, 400 = Bad Request, etc. - these won't change on retry
+                    if response.status_code >= 400 and response.status_code < 500:
+                        response.raise_for_status()  # Raise immediately, don't retry
+                    
+                    # Only retry on 5xx server errors
                     if response.status_code >= 500 and attempt < max_retries - 1:
                         wait_time = min(backoff_factor ** attempt, 15)
                         time.sleep(wait_time)
@@ -787,7 +998,11 @@ class EnhancedHubSpotClient:
 
                 return response
 
+            except requests.exceptions.HTTPError:
+                # Don't retry HTTP errors (4xx, 5xx that we already handled above)
+                raise
             except requests.exceptions.RequestException as e:
+                # Only retry on network/connection errors
                 logger.error(f"Request failed (attempt {attempt + 1}): {e}")
                 if attempt == max_retries - 1:
                     raise
@@ -1254,33 +1469,41 @@ class EnhancedSyncEngine:
 
     def sync_once(self) -> Dict[str, Any]:
         """Run one complete sync cycle"""
-        logger.info("Starting sync cycle...")
+        global _sync_in_progress
         
-        # Reset diagnostics for this sync
-        diagnostics = reset_diagnostics()
-
-        results = {
-            "start_time": utc_now().isoformat(),
-            "companies_to_hubspot": {"processed": 0, "created": 0, "updated": 0, "failed": 0},
-            "contacts_to_hubspot": {"processed": 0, "created": 0, "updated": 0, "failed": 0},
-            "companies_to_wrike": {"processed": 0, "updated": 0, "failed": 0},
-            "contacts_to_wrike": {"processed": 0, "updated": 0, "failed": 0},
-            "issues_found": 0,
-            "end_time": None,
-            "duration_seconds": None
-        }
-
-        start_time = utc_now()
+        # Check if sync is already running
+        if not _sync_lock.acquire(blocking=False):
+            logger.warning("Sync already in progress, skipping...")
+            return {"error": "Sync already in progress", "skipped": True}
         
-        # Start activity tracking
-        activity_id = self.db.start_activity("full_sync")
-        results["activity_id"] = activity_id
-        total_changes = 0
-        total_companies = 0
-        total_contacts = 0
-        total_errors = 0
-
         try:
+            _sync_in_progress = True
+            logger.info("Starting sync cycle...")
+            
+            # Reset diagnostics for this sync
+            diagnostics = reset_diagnostics()
+
+            results = {
+                "start_time": utc_now().isoformat(),
+                "companies_to_hubspot": {"processed": 0, "created": 0, "updated": 0, "failed": 0},
+                "contacts_to_hubspot": {"processed": 0, "created": 0, "updated": 0, "failed": 0},
+                "companies_to_wrike": {"processed": 0, "updated": 0, "failed": 0},
+                "contacts_to_wrike": {"processed": 0, "updated": 0, "failed": 0},
+                "issues_found": 0,
+                "end_time": None,
+                "duration_seconds": None
+            }
+
+            start_time = utc_now()
+            
+            # Start activity tracking
+            activity_id = self.db.start_activity("full_sync")
+            results["activity_id"] = activity_id
+            total_changes = 0
+            total_companies = 0
+            total_contacts = 0
+            total_errors = 0
+
             # 1. Wrike -> HubSpot (Companies)
             logger.info("Syncing companies from Wrike to HubSpot...")
             company_results = self.sync_wrike_to_hubspot_companies(activity_id)
@@ -1388,6 +1611,10 @@ class EnhancedSyncEngine:
                 message=str(e)
             )
             raise
+        finally:
+            # Always release the sync lock
+            _sync_in_progress = False
+            _sync_lock.release()
 
     def sync_wrike_to_hubspot_companies(self, activity_id: int = None) -> Dict[str, int]:
         """Sync companies from Wrike to HubSpot"""
@@ -1460,6 +1687,7 @@ class EnhancedSyncEngine:
 
                 if hubspot_company_id:
                     # Get current HubSpot values for comparison
+                    hubspot_exists = True
                     try:
                         current = self.hub.get_object("companies", hubspot_company_id, 
                             list(self.hp_company_props.values()))
@@ -1476,15 +1704,24 @@ class EnhancedSyncEngine:
                             "affinity_score": current_props.get(self.hp_company_props['affinity_score']),
                             "priority": current_props.get(self.hp_company_props['account_priority'])
                         }
-                    except:
-                        pass
+                    except Exception as e:
+                        if "404" in str(e):
+                            # HubSpot company was deleted - clear stale mapping
+                            logger.warning(f"│  ⚠ HubSpot company {hubspot_company_id} not found (deleted?)")
+                            logger.info(f"│  Clearing stale mapping and searching by Wrike ID...")
+                            hubspot_exists = False
+                            hubspot_company_id = None  # Clear so we fall through to search/create
+                        else:
+                            raise
                     
-                    # Update existing HubSpot company
-                    self.hub.update_object("companies", hubspot_company_id, company_props)
-                    results["updated"] += 1
-                    sync_detail["action"] = "updated"
-                    logger.info(f"│  ✓ UPDATED HubSpot ID: {hubspot_company_id}")
-                else:
+                    if hubspot_exists:
+                        # Update existing HubSpot company
+                        self.hub.update_object("companies", hubspot_company_id, company_props)
+                        results["updated"] += 1
+                        sync_detail["action"] = "updated"
+                        logger.info(f"│  ✓ UPDATED HubSpot ID: {hubspot_company_id}")
+                
+                if not hubspot_company_id:
                     # No mapping exists - search HubSpot by Wrike Client ID (NOT by name)
                     wrike_task_id_prop = self.hp_company_props.get("wrike_task_id", "wrike_task_id")
                     filters = [{"filters": [{"propertyName": wrike_task_id_prop, "operator": "EQ", "value": wrike_task_id}]}]
@@ -1849,8 +2086,18 @@ class EnhancedSyncEngine:
                         hubspot_company = self.hub.get_object("companies", wrike_hubspot_id, ["name"])
                         hub_id = wrike_hubspot_id
                         actual_hubspot_name = hubspot_company.get("properties", {}).get("name", "")
-                    except:
-                        pass
+                    except Exception as e:
+                        if "404" in str(e):
+                            # HubSpot company was deleted - clear stale ID from Wrike
+                            logger.warning(f"│  ⚠ HubSpot ID {wrike_hubspot_id} not found (deleted?) - clearing from Wrike")
+                            # Clear the stale HubSpot ID from Wrike
+                            hubspot_id_cf = self.w_company_cf.get("hubspot_account_id")
+                            if hubspot_id_cf:
+                                try:
+                                    self.wrk.update_task(wrike_task_id, custom_fields=wrike_cf_set([], hubspot_id_cf, ""))
+                                except:
+                                    pass
+                        # Continue to search by Wrike ID instead
                 
                 if not hubspot_company:
                     # Fallback: Search by Wrike Client ID in HubSpot
@@ -1909,7 +2156,7 @@ class EnhancedSyncEngine:
                 
                 # Record the change (or match) if tracking activity
                 if activity_id:
-                    self.db.record_change(activity_id, company_name, wrike_task_id, hub_id,
+                    self.db.record_change(activity_id, wrike_task_title, wrike_task_id, hub_id,
                         "company", "HubSpot Account Name", "Wrike",
                         wrike_hubspot_name, actual_hubspot_name, name_changed)
                 
@@ -1995,8 +2242,15 @@ class EnhancedSyncEngine:
                         hubspot_company = self.hub.get_object("companies", wrike_hubspot_id, ["name", wrike_task_id_prop])
                         hubspot_id = wrike_hubspot_id
                         current_wrike_id_in_hubspot = hubspot_company.get("properties", {}).get(wrike_task_id_prop)
-                    except:
-                        pass
+                    except Exception as e:
+                        if "404" in str(e):
+                            # HubSpot company was deleted - clear stale ID from Wrike
+                            logger.warning(f"│  ⚠ HubSpot ID {wrike_hubspot_id} not found - clearing from Wrike")
+                            try:
+                                self.wrk.update_task(wrike_task_id, custom_fields=wrike_cf_set([], hubspot_account_id_field, ""))
+                            except:
+                                pass
+                        # Fall through to Method 2 (search by Wrike ID)
                 
                 # Method 2: Search HubSpot by Wrike Client ID
                 if not hubspot_company:
@@ -2101,3 +2355,547 @@ class EnhancedSyncEngine:
             
         logger.info(f"Reconciliation report exported to {path}")
         return path
+
+    # ============================================
+    # EVENT-DRIVEN SYNC METHODS
+    # ============================================
+
+    def detect_wrike_changes(self, since: datetime = None) -> List[Dict]:
+        """
+        Detect changes in Wrike since the last check.
+        Returns list of changed tasks with their IDs and change type.
+        """
+        state_key = "change_detection_wrike_last"
+        last_check = self.db.get_state(state_key)
+        
+        if since:
+            start = since
+        elif last_check:
+            start = dtparser.parse(last_check)
+        else:
+            # First run: check last hour
+            start = utc_now() - timedelta(hours=1)
+        
+        end = utc_now()
+        companies_folder = self.cfg.wrike["companies_folder_id"]
+        
+        changes = []
+        try:
+            for task in self.wrk.query_tasks_in_folder_updated_between(
+                companies_folder, start, end, descendants=True
+            ):
+                task_id = safe_str(task.get("id"))
+                task_title = safe_str(task.get("title", ""))
+                
+                # Only track AdminCard tasks (companies)
+                if "AdminCard" not in task_title:
+                    continue
+                
+                company_name = clean_company_name_for_hubspot(task_title)
+                
+                change = {
+                    "source": "wrike",
+                    "record_id": task_id,
+                    "record_name": company_name,
+                    "change_type": "update",
+                    "updated_date": task.get("updatedDate")
+                }
+                changes.append(change)
+                
+                # Track in database
+                self.db.track_change("wrike", task_id, company_name, "update")
+            
+            # Update state
+            self.db.set_state(state_key, end.isoformat())
+            
+            logger.info(f"Detected {len(changes)} Wrike changes since {start.isoformat()}")
+            return changes
+            
+        except Exception as e:
+            logger.error(f"Failed to detect Wrike changes: {e}")
+            return []
+
+    def detect_hubspot_changes(self, since: datetime = None) -> List[Dict]:
+        """
+        Detect changes in HubSpot since the last check.
+        Returns list of changed companies with their IDs.
+        """
+        state_key = "change_detection_hubspot_last"
+        last_check = self.db.get_state(state_key)
+        
+        if since:
+            start = since
+        elif last_check:
+            start = dtparser.parse(last_check)
+        else:
+            # First run: check last hour
+            start = utc_now() - timedelta(hours=1)
+        
+        end = utc_now()
+        
+        changes = []
+        try:
+            # Search for companies modified since start time
+            filters = [{"filters": [{
+                "propertyName": "hs_lastmodifieddate",
+                "operator": "GTE",
+                "value": to_epoch_ms(start)
+            }]}]
+            
+            properties = list(self.hp_company_props.values()) + ["hs_lastmodifieddate"]
+            search_results = self.hub.search_objects(
+                "companies", filters, properties=properties,
+                sorts=["hs_lastmodifieddate"], limit=100
+            )
+            
+            for company in search_results.get("results", []):
+                company_id = company["id"]
+                company_name = company["properties"].get(self.hp_company_props["name"], "")
+                
+                change = {
+                    "source": "hubspot",
+                    "record_id": company_id,
+                    "record_name": company_name,
+                    "change_type": "update",
+                    "last_modified": company["properties"].get("hs_lastmodifieddate")
+                }
+                changes.append(change)
+                
+                # Track in database
+                self.db.track_change("hubspot", company_id, company_name, "update")
+            
+            # Update state
+            self.db.set_state(state_key, end.isoformat())
+            
+            logger.info(f"Detected {len(changes)} HubSpot changes since {start.isoformat()}")
+            return changes
+            
+        except Exception as e:
+            logger.error(f"Failed to detect HubSpot changes: {e}")
+            return []
+
+    def detect_and_sync_changes(self) -> Dict[str, Any]:
+        """
+        Main change detection job: detect changes in both systems and sync them.
+        This is called by the scheduler every N minutes.
+        """
+        results = {
+            "wrike_changes_detected": 0,
+            "hubspot_changes_detected": 0,
+            "synced": 0,
+            "failed": 0,
+            "timestamp": utc_now().isoformat()
+        }
+        
+        logger.info("🔄 Starting change detection cycle...")
+        
+        # 1. Detect changes in Wrike
+        wrike_changes = self.detect_wrike_changes()
+        results["wrike_changes_detected"] = len(wrike_changes)
+        
+        # 2. Detect changes in HubSpot
+        hubspot_changes = self.detect_hubspot_changes()
+        results["hubspot_changes_detected"] = len(hubspot_changes)
+        
+        # 3. Process pending changes
+        pending = self.db.get_pending_changes(limit=50)
+        logger.info(f"Processing {len(pending)} pending changes...")
+        
+        for change in pending:
+            try:
+                sync_result = self.sync_single_record(
+                    change["source"], 
+                    change["record_id"]
+                )
+                
+                if sync_result.get("success"):
+                    self.db.mark_change_synced(change["id"])
+                    results["synced"] += 1
+                else:
+                    error_msg = sync_result.get("error", "Unknown error")
+                    self.db.mark_change_failed(change["id"], error_msg)
+                    results["failed"] += 1
+                    
+            except Exception as e:
+                logger.error(f"Failed to sync change {change['id']}: {e}")
+                self.db.mark_change_failed(change["id"], str(e))
+                results["failed"] += 1
+        
+        # 4. Cleanup old changes (every 100th run)
+        if results["synced"] % 100 == 0:
+            cleaned = self.db.cleanup_old_changes(days=30)
+            if cleaned > 0:
+                logger.info(f"Cleaned up {cleaned} old change records")
+        
+        logger.info(f"✓ Change detection complete: {results}")
+        return results
+
+    def sync_single_record(self, source: str, record_id: str) -> Dict[str, Any]:
+        """
+        Sync a single record by its source and ID.
+        This is used for event-driven sync when a specific record changes.
+        """
+        result = {"success": False, "source": source, "record_id": record_id}
+        
+        try:
+            if source == "wrike":
+                result = self._sync_single_wrike_company(record_id)
+            elif source == "hubspot":
+                result = self._sync_single_hubspot_company(record_id)
+            else:
+                result["error"] = f"Unknown source: {source}"
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to sync {source} record {record_id}: {e}")
+            result["error"] = str(e)
+            return result
+
+    def _sync_single_wrike_company(self, wrike_task_id: str) -> Dict[str, Any]:
+        """Sync a single Wrike company to HubSpot"""
+        result = {"success": False, "source": "wrike", "record_id": wrike_task_id}
+        
+        try:
+            # Get the Wrike task
+            task = self.wrk.get_task(wrike_task_id)
+            task_title = safe_str(task.get("title", ""))
+            
+            # Skip non-AdminCard tasks
+            if "AdminCard" not in task_title:
+                result["skipped"] = True
+                result["reason"] = "Not an AdminCard task"
+                return result
+            
+            company_name = clean_company_name_for_hubspot(task_title)
+            logger.info(f"🔄 Syncing single Wrike company: {company_name} ({wrike_task_id})")
+            
+            # Get custom field values
+            account_status = wrike_cf_get(task, self.w_company_cf["account_status"])
+            affinity_score = wrike_cf_get(task, self.w_company_cf["affinity_score"])
+            account_tier = wrike_cf_get(task, self.w_company_cf["account_tier"])
+            account_priority = self.tier_to_priority.get(account_tier, account_tier)
+            
+            # Prepare HubSpot properties
+            wrike_task_id_prop = self.hp_company_props.get("wrike_task_id", "wrike_task_id")
+            company_props = {
+                self.hp_company_props["name"]: company_name,
+                self.hp_company_props["account_status"]: account_status,
+                self.hp_company_props["affinity_score"]: affinity_score,
+                self.hp_company_props["account_priority"]: account_priority,
+                wrike_task_id_prop: wrike_task_id,
+            }
+            
+            # Check if we have a mapping
+            hubspot_company_id = self.db.get_hubspot_company_id(wrike_task_id)
+            
+            if hubspot_company_id:
+                # Update existing HubSpot company
+                try:
+                    self.hub.update_object("companies", hubspot_company_id, company_props)
+                    result["action"] = "updated"
+                    result["hubspot_id"] = hubspot_company_id
+                except Exception as e:
+                    if "404" in str(e):
+                        # Company was deleted, search by Wrike ID
+                        hubspot_company_id = None
+                    else:
+                        raise
+            
+            if not hubspot_company_id:
+                # Search HubSpot by Wrike Client ID
+                filters = [{"filters": [{
+                    "propertyName": wrike_task_id_prop,
+                    "operator": "EQ",
+                    "value": wrike_task_id
+                }]}]
+                
+                search_res = self.hub.search_objects("companies", filters,
+                    properties=list(self.hp_company_props.values()), sorts=[], limit=1)
+                
+                if search_res.get("results"):
+                    hubspot_company_id = search_res["results"][0]["id"]
+                    self.hub.update_object("companies", hubspot_company_id, company_props)
+                    result["action"] = "matched_and_updated"
+                    result["hubspot_id"] = hubspot_company_id
+                else:
+                    # Create new company
+                    new_company = self.hub.create_object("companies", company_props)
+                    hubspot_company_id = new_company.get("id")
+                    result["action"] = "created"
+                    result["hubspot_id"] = hubspot_company_id
+                
+                # Update mapping
+                self.db.upsert_company_mapping(wrike_task_id, hubspot_company_id, company_name)
+            
+            result["success"] = True
+            result["company_name"] = company_name
+            logger.info(f"✓ Synced {company_name}: {result['action']}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to sync Wrike company {wrike_task_id}: {e}")
+            result["error"] = str(e)
+            return result
+
+    def _sync_single_hubspot_company(self, hubspot_company_id: str) -> Dict[str, Any]:
+        """Sync a single HubSpot company to Wrike"""
+        result = {"success": False, "source": "hubspot", "record_id": hubspot_company_id}
+        
+        try:
+            # Get the HubSpot company
+            company = self.hub.get_object("companies", hubspot_company_id,
+                list(self.hp_company_props.values()))
+            
+            props = company.get("properties", {})
+            company_name = props.get(self.hp_company_props["name"], "")
+            
+            logger.info(f"🔄 Syncing single HubSpot company: {company_name} ({hubspot_company_id})")
+            
+            # Find linked Wrike task
+            wrike_id = self.db.get_wrike_company_id_by_hubspot(hubspot_company_id)
+            
+            if not wrike_id:
+                # Try to find by Wrike Client ID property
+                wrike_task_id_prop = self.hp_company_props.get("wrike_task_id", "wrike_task_id")
+                wrike_id = props.get(wrike_task_id_prop)
+            
+            if not wrike_id:
+                result["skipped"] = True
+                result["reason"] = "No linked Wrike task found"
+                return result
+            
+            # Get values from HubSpot
+            status = props.get(self.hp_company_props["account_status"])
+            affinity = props.get(self.hp_company_props["affinity_score"])
+            priority = props.get(self.hp_company_props["account_priority"])
+            tier = self.priority_to_tier.get(priority, priority)
+            
+            # Prepare Wrike custom fields
+            custom_fields = []
+            custom_fields = wrike_cf_set(custom_fields, self.w_company_cf["account_status"], status)
+            custom_fields = wrike_cf_set(custom_fields, self.w_company_cf["affinity_score"], affinity)
+            custom_fields = wrike_cf_set(custom_fields, self.w_company_cf["account_tier"], tier)
+            
+            # Also update HubSpot Account Name in Wrike
+            hubspot_name_field = self.w_company_cf.get("hubspot_account_name")
+            if hubspot_name_field:
+                custom_fields = wrike_cf_set(custom_fields, hubspot_name_field, company_name)
+            
+            # Also update HubSpot Account ID in Wrike
+            hubspot_id_field = self.w_company_cf.get("hubspot_account_id")
+            if hubspot_id_field:
+                custom_fields = wrike_cf_set(custom_fields, hubspot_id_field, hubspot_company_id)
+            
+            # Update Wrike task (don't update title to preserve AdminCard prefix)
+            self.wrk.update_task(wrike_id, custom_fields=custom_fields)
+            
+            # Update mapping
+            self.db.upsert_company_mapping(wrike_id, hubspot_company_id, company_name)
+            
+            result["success"] = True
+            result["action"] = "updated"
+            result["wrike_id"] = wrike_id
+            result["company_name"] = company_name
+            logger.info(f"✓ Synced {company_name} to Wrike: updated")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Failed to sync HubSpot company {hubspot_company_id}: {e}")
+            result["error"] = str(e)
+            return result
+
+    # ============================================
+    # DAILY RECONCILIATION
+    # ============================================
+
+    def daily_reconciliation(self) -> Dict[str, Any]:
+        """
+        Daily reconciliation job: compare all records in both systems,
+        identify discrepancies, and optionally auto-fix them.
+        """
+        logger.info("📊 Starting daily reconciliation...")
+        
+        report = {
+            "wrike_total": 0,
+            "hubspot_total": 0,
+            "matched": 0,
+            "wrike_only": 0,
+            "hubspot_only": 0,
+            "mismatched": 0,
+            "auto_fixed": 0,
+            "status": "running",
+            "details": {
+                "wrike_only_records": [],
+                "hubspot_only_records": [],
+                "mismatched_records": [],
+                "fixed_records": []
+            }
+        }
+        
+        try:
+            # 1. Get all Wrike companies (AdminCard tasks)
+            companies_folder = self.cfg.wrike["companies_folder_id"]
+            wrike_companies = {}
+            
+            # Query all tasks (look back 1 year to get all)
+            for task in self.wrk.query_tasks_in_folder_updated_between(
+                companies_folder,
+                utc_now() - timedelta(days=365),
+                utc_now(),
+                descendants=True
+            ):
+                task_id = safe_str(task.get("id"))
+                task_title = safe_str(task.get("title", ""))
+                
+                if "AdminCard" not in task_title:
+                    continue
+                
+                company_name = clean_company_name_for_hubspot(task_title)
+                wrike_hubspot_id = wrike_cf_get(task, self.w_company_cf.get("hubspot_account_id", ""))
+                
+                wrike_companies[task_id] = {
+                    "name": company_name,
+                    "hubspot_id": wrike_hubspot_id,
+                    "status": wrike_cf_get(task, self.w_company_cf["account_status"]),
+                    "affinity": wrike_cf_get(task, self.w_company_cf["affinity_score"]),
+                    "tier": wrike_cf_get(task, self.w_company_cf["account_tier"])
+                }
+            
+            report["wrike_total"] = len(wrike_companies)
+            logger.info(f"Found {report['wrike_total']} Wrike companies")
+            
+            # 2. Get all HubSpot companies
+            hubspot_companies = {}
+            wrike_task_id_prop = self.hp_company_props.get("wrike_task_id", "wrike_task_id")
+            
+            # Search all companies (no filter)
+            after = None
+            while True:
+                search_res = self.hub.search_objects(
+                    "companies",
+                    filter_groups=[],
+                    properties=list(self.hp_company_props.values()) + [wrike_task_id_prop],
+                    sorts=[],
+                    after=after,
+                    limit=100
+                )
+                
+                for company in search_res.get("results", []):
+                    company_id = company["id"]
+                    props = company.get("properties", {})
+                    wrike_id = props.get(wrike_task_id_prop)
+                    
+                    hubspot_companies[company_id] = {
+                        "name": props.get(self.hp_company_props["name"], ""),
+                        "wrike_id": wrike_id,
+                        "status": props.get(self.hp_company_props["account_status"]),
+                        "affinity": props.get(self.hp_company_props["affinity_score"]),
+                        "priority": props.get(self.hp_company_props["account_priority"])
+                    }
+                
+                # Check for pagination
+                paging = search_res.get("paging", {})
+                after = paging.get("next", {}).get("after")
+                if not after:
+                    break
+            
+            report["hubspot_total"] = len(hubspot_companies)
+            logger.info(f"Found {report['hubspot_total']} HubSpot companies")
+            
+            # 3. Build reverse lookup: Wrike ID -> HubSpot ID
+            hubspot_by_wrike_id = {}
+            for hub_id, hub_data in hubspot_companies.items():
+                if hub_data.get("wrike_id"):
+                    hubspot_by_wrike_id[hub_data["wrike_id"]] = hub_id
+            
+            # 4. Compare and identify discrepancies
+            for wrike_id, wrike_data in wrike_companies.items():
+                hub_id = wrike_data.get("hubspot_id") or hubspot_by_wrike_id.get(wrike_id)
+                
+                if hub_id and hub_id in hubspot_companies:
+                    # Both exist - check for mismatches
+                    hub_data = hubspot_companies[hub_id]
+                    
+                    # Compare key fields
+                    mismatches = []
+                    
+                    # Status mismatch
+                    if wrike_data["status"] and hub_data["status"]:
+                        if wrike_data["status"] != hub_data["status"]:
+                            mismatches.append(f"status: Wrike={wrike_data['status']}, HubSpot={hub_data['status']}")
+                    
+                    # Affinity mismatch
+                    if wrike_data["affinity"] and hub_data["affinity"]:
+                        if str(wrike_data["affinity"]) != str(hub_data["affinity"]):
+                            mismatches.append(f"affinity: Wrike={wrike_data['affinity']}, HubSpot={hub_data['affinity']}")
+                    
+                    if mismatches:
+                        report["mismatched"] += 1
+                        report["details"]["mismatched_records"].append({
+                            "wrike_id": wrike_id,
+                            "hubspot_id": hub_id,
+                            "name": wrike_data["name"],
+                            "mismatches": mismatches
+                        })
+                    else:
+                        report["matched"] += 1
+                    
+                    # Mark as processed
+                    hubspot_companies[hub_id]["_processed"] = True
+                else:
+                    # Wrike only - no HubSpot link
+                    report["wrike_only"] += 1
+                    report["details"]["wrike_only_records"].append({
+                        "wrike_id": wrike_id,
+                        "name": wrike_data["name"]
+                    })
+            
+            # Check for HubSpot-only records
+            for hub_id, hub_data in hubspot_companies.items():
+                if not hub_data.get("_processed"):
+                    report["hubspot_only"] += 1
+                    report["details"]["hubspot_only_records"].append({
+                        "hubspot_id": hub_id,
+                        "name": hub_data["name"],
+                        "wrike_id": hub_data.get("wrike_id")
+                    })
+            
+            # 5. Log summary
+            report["status"] = "completed"
+            logger.info(f"═" * 50)
+            logger.info(f"📊 RECONCILIATION SUMMARY")
+            logger.info(f"═" * 50)
+            logger.info(f"   Wrike companies:    {report['wrike_total']}")
+            logger.info(f"   HubSpot companies:  {report['hubspot_total']}")
+            logger.info(f"   ────────────────────")
+            logger.info(f"   Matched:            {report['matched']}")
+            logger.info(f"   Wrike only:         {report['wrike_only']}")
+            logger.info(f"   HubSpot only:       {report['hubspot_only']}")
+            logger.info(f"   Mismatched fields:  {report['mismatched']}")
+            logger.info(f"═" * 50)
+            
+            # 6. Save report to database
+            self.db.save_reconciliation_report(report)
+            
+            # 7. Create issues for discrepancies
+            for record in report["details"]["wrike_only_records"][:20]:  # Limit to 20
+                self.db.add_issue(
+                    "reconciliation", "company", record["wrike_id"],
+                    "wrike_only", f"Company '{record['name']}' exists in Wrike but not linked in HubSpot"
+                )
+            
+            for record in report["details"]["mismatched_records"][:20]:  # Limit to 20
+                self.db.add_issue(
+                    "reconciliation", "company", record["wrike_id"],
+                    "field_mismatch", f"Company '{record['name']}' has mismatched fields: {', '.join(record['mismatches'])}"
+                )
+            
+            return report
+            
+        except Exception as e:
+            logger.error(f"Reconciliation failed: {e}")
+            report["status"] = "failed"
+            report["error"] = str(e)
+            self.db.save_reconciliation_report(report)
+            return report

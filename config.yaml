@@ -49,6 +49,29 @@ sync:
   polling_interval_seconds: 300
   sync_contacts_hubspot_to_wrike: true
   
+  # ============================================
+  # EVENT-DRIVEN SYNC SETTINGS
+  # ============================================
+  
+  # Change detection polling interval (minutes)
+  # The system will check for changes every N minutes
+  change_detection_interval_minutes: 2
+  
+  # Daily reconciliation hour (0-23, in server's timezone)
+  # Full comparison runs at this hour daily
+  reconciliation_hour: 0
+  
+  # Enable webhooks for instant sync (requires public URL)
+  # Set to true when deployed to a public server
+  webhooks_enabled: false
+  
+  # Webhook secret for signature verification (optional security)
+  # webhook_secret: "your-secret-here"
+  
+  # ============================================
+  # FIELD MAPPINGS
+  # ============================================
+  
   # Mapping for Wrike Tier to HubSpot Company Priority
   tier_to_priority:
     "Tier 1": "Hot to Trot"
