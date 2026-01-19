@@ -1,0 +1,19 @@
+{
+  "wrike": {
+    "api_token": "your-wrike-permanent-access-token",
+    "base_url": "https://www.wrike.com/api/v4",
+    "timeout": 30
+  },
+  "hubspot": {
+    "api_key": "your-hubspot-api-key"
+  },
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  },
+  "integration": {
+    "sync_interval": 300,
+    "retry_attempts": 3,
+    "retry_delay": 5
+  }
+}

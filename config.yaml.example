@@ -1,0 +1,100 @@
+# Wrike-HubSpot Integration Configuration
+# Copy this file to config.yaml and update with your actual credentials and settings
+
+# Environment
+environment: development  # development, staging, production
+
+# HubSpot Configuration
+hubspot:
+  api_key: "your-hubspot-api-key-here"
+
+  # Field mappings: Wrike field name -> HubSpot property name
+  company_properties:
+    name: "name"                    # Company name
+    account_status: "account_status" # Account status
+    affinity_score: "affinity_score" # Affinity score
+    account_tier: "account_tier"    # Account tier
+
+  contact_properties:
+    first_name: "firstname"         # First name
+    last_name: "lastname"          # Last name
+    email: "email"                 # Email address
+    title: "jobtitle"              # Job title
+    phone: "phone"                 # Phone number
+    mobile: "mobilephone"          # Mobile phone
+    address1: "address"            # Street address
+    city: "city"                   # City
+    state: "state"                 # State/Province
+    country: "country"             # Country
+
+# Wrike Configuration
+wrike:
+  api_token: "your-wrike-permanent-token-here"
+  base_url: "https://www.wrike.com/api/v4"
+
+  # Wrike folder IDs for different entity types
+  companies_folder_id: "your-companies-folder-id"
+  contacts_folder_id: "your-contacts-folder-id"
+
+  # Custom field mappings: Your field name -> Wrike custom field ID
+  company_custom_fields:
+    account_status: "your-account-status-field-id"
+    affinity_score: "your-affinity-score-field-id"
+    account_tier: "your-account-tier-field-id"
+
+  contact_custom_fields:
+    first_name: "your-first-name-field-id"
+    last_name: "your-last-name-field-id"
+    email: "your-email-field-id"
+    title: "your-title-field-id"
+    phone: "your-phone-field-id"
+    mobile: "your-mobile-field-id"
+    address1: "your-address-field-id"
+    city: "your-city-field-id"
+    state: "your-state-field-id"
+    country: "your-country-field-id"
+
+# Sync Configuration
+sync:
+  # Polling interval in seconds (how often to check for updates)
+  polling_interval_seconds: 300
+
+  # Whether to create companies in HubSpot if they don't exist
+  create_missing_companies_in_hubspot: true
+
+  # Whether to sync contacts from HubSpot back to Wrike
+  sync_contacts_hubspot_to_wrike: false
+
+  # Field value mappings
+  tier_to_priority:
+    "Tier 1": "High"
+    "Tier 2": "Medium"
+    "Tier 3": "Low"
+    "1": "High"
+    "2": "Medium"
+    "3": "Low"
+
+  priority_to_tier:
+    "High": "Tier 1"
+    "Medium": "Tier 2"
+    "Low": "Tier 3"
+
+# Notification Configuration (optional)
+notifications:
+  email:
+    enabled: false
+    smtp_server: "smtp.gmail.com"
+    smtp_port: 587
+    sender_email: "noreply@yourcompany.com"
+    recipient_emails: ["admin@yourcompany.com"]
+    on_sync_failure: true
+    on_sync_success: false
+
+  slack:
+    enabled: false
+    webhook_url: "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+    channel: "#sync-notifications"
+    on_sync_failure: true
+    on_sync_success: false
+
+

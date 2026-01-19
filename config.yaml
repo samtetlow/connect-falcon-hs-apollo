@@ -1,0 +1,63 @@
+hubspot:
+  company_properties:
+    name: "name"
+    account_status: "account_status__c"      # "Account Status" dropdown
+    affinity_score: "affinity_score__c"      # "Affinity Score" dropdown (1-4)
+    account_priority: "priority__c"          # "Company Priority" (Hot to Trot/Warm/Cool)
+    wrike_task_id: "wrike_task_id"           # Wrike Task ID (Text) - auto-synced bidirectionally (allows special chars)
+  contact_properties:
+    firstname: "firstname"
+    lastname: "lastname"
+    jobtitle: "jobtitle"
+    email: "email"
+    phone: "phone"
+    mobilephone: "mobilephone"
+    address: "address"
+    address2: "address2"
+    city: "city"
+    state: "state"
+    country: "country"
+
+wrike:
+  # IDs for your specific Wrike folders/spaces
+  # Clients space - contains all client folders
+  companies_folder_id: "IEAFXTW5I5EXBNPV" 
+  contacts_folder_id: "IEAFXTW5I5EXBNPV"  # Same folder for now
+  
+  # Custom Field IDs from Wrike (Falcon) - VERIFIED
+  company_custom_fields:
+    account_status: "IEAFXTW5JUAFDNWF"    # Hubspot Account Status (DropDown)
+    affinity_score: "IEAFXTW5JUAFOG4X"    # Client Affinity Score (Numeric)
+    account_tier: "IEAFXTW5JUAGBIFX"      # Tier (DropDown) - maps to HubSpot Priority
+    hubspot_account_name: "IEAFXTW5JUAFOG4F"  # Hubspot Account Name (Text) - auto-synced from HubSpot
+    hubspot_account_id: "IEAFXTW5JUAISUWC"   # HubSpot ID (Text) - auto-synced bidirectionally
+  
+  contact_custom_fields:
+    first_name: "IEAFXTW5JUAFIWRD"        # First Name (Text)
+    last_name: "IEAFXTW5JUAFIWRE"         # Last Name (Text)
+    # title: NOT AVAILABLE IN WRIKE - Do not sync
+    email: "IEAFXTW5JUAFGWCI"             # Email Address (Text)
+    phone: "IEAFXTW5JUAFITGS"             # Phone Number (Text)
+    mobile: "IEAFXTW5JUAFITGS"            # Phone Number (same field, no separate mobile)
+    address1: "IEAFXTW5JUAFJAR7"          # Address Line 1 (Text)
+    address2: "IEAFXTW5JUAFMVWM"          # Address Line 2 (Text)
+    city: "IEAFXTW5JUAFIWRC"              # City (Text)
+    state: "IEAFXTW5JUAFMVWJ"             # State (Text)
+    country: "IEAFXTW5JUAFMVWK"           # Country (Text)
+
+sync:
+  polling_interval_seconds: 300
+  sync_contacts_hubspot_to_wrike: true
+  
+  # Mapping for Wrike Tier to HubSpot Company Priority
+  tier_to_priority:
+    "Tier 1": "Hot to Trot"
+    "Tier 2": "Warm"
+    "Tier 3": "Cool"
+  
+  priority_to_tier:
+    "Hot to Trot": "Tier 1"
+    "Warm": "Tier 2"
+    "Cool": "Tier 3"
+
+environment: "production"
