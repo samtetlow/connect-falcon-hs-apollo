@@ -37,20 +37,24 @@ from hubspot_client import HubSpotClient
 
 # --- Enhanced Logging ---
 def setup_logging():
-    """Configure comprehensive logging"""
+    """Configure comprehensive logging (console-only on Vercel due to read-only filesystem)"""
     log_format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-
-    # Create logs directory if it doesn't exist
-    if not os.path.exists('logs'):
-        os.makedirs('logs')
+    
+    handlers = [logging.StreamHandler(sys.stdout)]
+    
+    # Only add file logging if not on Vercel (read-only filesystem)
+    if not IS_VERCEL:
+        try:
+            if not os.path.exists('logs'):
+                os.makedirs('logs')
+            handlers.append(logging.FileHandler('logs/falcon_hubspot_sync.log', encoding='utf-8'))
+        except OSError:
+            pass  # Skip file logging if directory creation fails
 
     logging.basicConfig(
         level=logging.INFO,
         format=log_format,
-        handlers=[
-            logging.FileHandler('logs/falcon_hubspot_sync.log', encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)
-        ]
+        handlers=handlers
     )
     return logging.getLogger(__name__)
 
