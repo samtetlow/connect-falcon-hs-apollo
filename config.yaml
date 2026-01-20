@@ -55,11 +55,13 @@ sync:
   
   # Change detection polling interval (minutes)
   # The system will check for changes every N minutes
-  change_detection_interval_minutes: 2
+  # This syncs individual record changes automatically
+  change_detection_interval_minutes: 5
   
-  # Daily reconciliation hour (0-23, in server's timezone)
-  # Full comparison runs at this hour daily
-  reconciliation_hour: 0
+  # Full sync schedule (every 3 days at 2 AM UTC)
+  # Complete bidirectional sync of all records
+  full_sync_interval_days: 3
+  full_sync_hour: 2
   
   # Enable webhooks for instant sync (requires public URL)
   # Set to true when deployed to a public server

@@ -9,11 +9,11 @@
   "crons": [
     {
       "path": "/api/cron/change-detection",
-      "schedule": "*/2 * * * *"
+      "schedule": "*/5 * * * *"
     },
     {
-      "path": "/api/cron/reconciliation",
-      "schedule": "0 0 * * *"
+      "path": "/api/cron/full-sync",
+      "schedule": "0 2 */3 * *"
     }
   ]
 }
