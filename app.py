@@ -46,12 +46,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+SYNC_ENGINE_IMPORT_ERROR = None
 try:
     from sync_engine import EnhancedSyncEngine, EnhancedHubSpotClient, EnhancedWrikeClient, load_config as load_sync_config
     from database import EnhancedDB
     SYNC_ENGINE_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
     SYNC_ENGINE_AVAILABLE = False
+    SYNC_ENGINE_IMPORT_ERROR = str(e)
     logger.warning(f"Sync Engine not fully available: {e}")
 
 # Global clients
@@ -330,6 +332,22 @@ async def health_check():
         timestamp=datetime.now(),
         version="1.0.0"
     )
+
+@app.get("/api/debug/status")
+async def debug_status():
+    """Debug endpoint to diagnose sync engine initialization"""
+    sync_config_path = Path(__file__).parent / "config.yaml"
+    return {
+        "sync_engine_available": SYNC_ENGINE_AVAILABLE,
+        "sync_engine_import_error": SYNC_ENGINE_IMPORT_ERROR,
+        "sync_engine_initialized": sync_engine is not None,
+        "config_yaml_exists": sync_config_path.exists(),
+        "config_yaml_path": str(sync_config_path),
+        "is_vercel": IS_VERCEL,
+        "wrike_client_ready": wrike_client is not None,
+        "hubspot_client_ready": hubspot_client is not None,
+        "db_initialized": db is not None
+    }
 
 @app.get("/api/falcon/status")
 async def falcon_status():
