@@ -9,7 +9,7 @@
   "crons": [
     {
       "path": "/api/cron/change-detection",
-      "schedule": "*/5 * * * *"
+      "schedule": "0 14 * * *"
     },
     {
       "path": "/api/cron/full-sync",

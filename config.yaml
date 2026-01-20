@@ -53,10 +53,9 @@ sync:
   # EVENT-DRIVEN SYNC SETTINGS
   # ============================================
   
-  # Change detection polling interval (minutes)
-  # The system will check for changes every N minutes
+  # Change detection runs daily at 2 PM UTC (10 AM EST)
   # This syncs individual record changes automatically
-  change_detection_interval_minutes: 5
+  change_detection_hour: 14
   
   # Full sync schedule (every 3 days at 2 AM UTC)
   # Complete bidirectional sync of all records
