@@ -40,12 +40,20 @@ class DatabaseInterface(ABC):
 
 
 class SQLiteDatabase(DatabaseInterface):
-    """SQLite implementation for local development"""
+    """SQLite implementation for local development or in-memory for serverless"""
     
-    def __init__(self, path: str = "sync.db"):
+    def __init__(self, path: str = "sync.db", in_memory: bool = False):
         self.path = path
-        self.conn = sqlite3.connect(path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.in_memory = in_memory
+        
+        if in_memory:
+            # Use in-memory database for serverless environments
+            self.conn = sqlite3.connect(":memory:", check_same_thread=False)
+            logger.info("📦 Using in-memory SQLite (data won't persist between requests)")
+        else:
+            self.conn = sqlite3.connect(path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+        
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self._init_schema()
     
@@ -411,10 +419,17 @@ class EnhancedDB:
 
     def __init__(self, path: str = "sync.db"):
         self.is_postgres = IS_VERCEL and DATABASE_URL
+        self.is_in_memory = False
         
         if self.is_postgres:
             logger.info("🐘 Using PostgreSQL database (Vercel mode)")
             self._db = PostgreSQLDatabase(DATABASE_URL)
+        elif IS_VERCEL:
+            # On Vercel without Postgres, use in-memory SQLite
+            # Data won't persist between requests, but sync operations will work
+            logger.info("📦 Using in-memory SQLite (Vercel serverless mode)")
+            self._db = SQLiteDatabase(path, in_memory=True)
+            self.is_in_memory = True
         else:
             logger.info(f"📁 Using SQLite database: {path}")
             self._db = SQLiteDatabase(path)
@@ -873,4 +888,5 @@ class EnhancedDB:
             "wrike_only": r[5], "hubspot_only": r[6],
             "mismatched": r[7], "auto_fixed": r[8], "status": r[9]
         } for r in rows]
+
 
