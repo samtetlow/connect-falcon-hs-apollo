@@ -973,7 +973,7 @@ class EnhancedSyncEngine:
         try:
             _sync_in_progress = True
             start_sync_timer()  # Start timeout tracking for Vercel
-            logger.info(f"Starting sync cycle... (timeout: {VERCEL_TIMEOUT_SECONDS}s)")
+            logger.info(f"Starting sync cycle... (timeout: {VERCEL_TIMEOUT_SECONDS}s, vercel={IS_VERCEL})")
             
             # Reset diagnostics for this sync
             diagnostics = reset_diagnostics()
@@ -987,12 +987,42 @@ class EnhancedSyncEngine:
                 "issues_found": 0,
                 "end_time": None,
                 "duration_seconds": None,
-                "timeout_reached": False
+                "timeout_reached": False,
+                "vercel_mode": IS_VERCEL
             }
 
             start_time = utc_now()
             
-            # Start activity tracking
+            # On Vercel, only run step 1 (Wrike→HubSpot companies) to stay within timeout
+            # The cron job will run multiple times to process all steps over time
+            if IS_VERCEL:
+                logger.info("⚡ Vercel mode: running minimal sync (companies only)")
+                activity_id = self.db.start_activity("full_sync_vercel")
+                results["activity_id"] = activity_id
+                
+                # Only sync companies from Wrike to HubSpot
+                company_results = self.sync_wrike_to_hubspot_companies(activity_id)
+                results["companies_to_hubspot"].update(company_results)
+                
+                end_time = utc_now()
+                results["end_time"] = end_time.isoformat()
+                results["duration_seconds"] = (end_time - start_time).total_seconds()
+                results["status"] = "partial_vercel"
+                results["message"] = f"Vercel mode: processed {company_results.get('processed', 0)} companies in {results['duration_seconds']:.1f}s"
+                
+                self.db.complete_activity(
+                    activity_id, 
+                    companies=company_results.get("processed", 0), 
+                    contacts=0,
+                    changes=company_results.get("updated", 0) + company_results.get("created", 0), 
+                    errors=company_results.get("failed", 0),
+                    summary=results["message"]
+                )
+                
+                logger.info(f"└─ {results['message']}")
+                return results
+            
+            # Start activity tracking (full sync for non-Vercel)
             activity_id = self.db.start_activity("full_sync")
             results["activity_id"] = activity_id
             total_changes = 0
