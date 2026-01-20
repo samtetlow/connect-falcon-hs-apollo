@@ -1538,13 +1538,23 @@ class EnhancedSyncEngine:
         logger.info("┌─ SYNC: HubSpot Company Names → Wrike")
         logger.info(f"│  Field ID: {hubspot_name_field_id}")
         
+        # Use shorter lookback on Vercel to avoid timeout (7 days vs 365 days)
+        lookback_days = 7 if IS_VERCEL else 365
+        max_companies = 50 if IS_VERCEL else 1000  # Limit on Vercel to avoid timeout
+        
+        logger.info(f"│  Lookback: {lookback_days} days, Max: {max_companies} companies")
+        
         # Get all tasks in the companies folder with descendants
         for task in self.wrk.query_tasks_in_folder_updated_between(
             companies_folder, 
-            utc_now() - timedelta(days=365),  # Check all companies from last year
+            utc_now() - timedelta(days=lookback_days),
             utc_now(), 
             descendants=True
         ):
+            # Check if we've hit the limit (for Vercel timeout prevention)
+            if results["processed"] >= max_companies:
+                logger.info(f"│  ⚠ Reached limit of {max_companies} companies (Vercel timeout prevention)")
+                break
             try:
                 wrike_task_id = safe_str(task.get("id"))
                 wrike_task_title = safe_str(task.get("title", ""))
@@ -1554,6 +1564,10 @@ class EnhancedSyncEngine:
                     continue
                 
                 results["processed"] += 1
+                
+                # Progress logging every 25 companies
+                if results["processed"] % 25 == 0:
+                    logger.info(f"│  ... processed {results['processed']} companies")
                 
                 # Get HubSpot Account ID from Wrike (this is the proper way to match)
                 wrike_hubspot_id = wrike_cf_get(task, self.w_company_cf.get("hubspot_account_id", ""))
