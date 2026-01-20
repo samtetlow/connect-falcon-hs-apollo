@@ -1302,7 +1302,7 @@ class EnhancedSyncEngine:
         start = dtparser.parse(last) if last else (utc_now() - timedelta(days=7))
         end = utc_now()
 
-        results = {"processed": 0, "created": 0, "updated": 0, "failed": 0, "sync_details": []}
+        results = {"processed": 0, "created": 0, "updated": 0, "failed": 0, "skipped_no_email": 0, "sync_details": []}
 
         for task in self.wrk.query_tasks_in_folder_updated_between(
             contacts_folder, start, end, descendants=True
@@ -1314,7 +1314,7 @@ class EnhancedSyncEngine:
                 # Extract data using custom field mappings
                 email = wrike_cf_get(task, self.w_contact_cf["email"])
                 if not email:
-                    logger.warning(f"Contact task {wrike_task_id} missing email, skipping")
+                    results["skipped_no_email"] += 1
                     continue
 
                 firstname = wrike_cf_get(task, self.w_contact_cf["first_name"])
@@ -1401,6 +1401,12 @@ class EnhancedSyncEngine:
                 results["failed"] += 1
                 self.db.add_issue("wrike", "contact", wrike_task_id, "sync_error", str(e))
 
+        # Log summary of skipped contacts
+        if results["skipped_no_email"] > 0:
+            logger.info(f"│  ℹ Skipped {results['skipped_no_email']} tasks without email (likely company records)")
+        
+        logger.info(f"└─ Contacts sync complete: {results['created']} created, {results['updated']} updated, {results['skipped_no_email']} skipped")
+        
         self.db.set_state(state_key, end.isoformat())
         return results
 
