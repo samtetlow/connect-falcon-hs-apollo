@@ -27,6 +27,22 @@ from database import EnhancedDB, IS_VERCEL
 _sync_lock = threading.Lock()
 _sync_in_progress = False
 
+# Vercel timeout handling - functions must complete in ~8 seconds to be safe
+VERCEL_TIMEOUT_SECONDS = 8 if IS_VERCEL else 300
+_sync_start_time = None
+
+def start_sync_timer():
+    """Start the sync timer for timeout checking"""
+    global _sync_start_time
+    _sync_start_time = time.time()
+
+def is_timeout_approaching() -> bool:
+    """Check if we're approaching the Vercel timeout"""
+    if not IS_VERCEL or _sync_start_time is None:
+        return False
+    elapsed = time.time() - _sync_start_time
+    return elapsed >= VERCEL_TIMEOUT_SECONDS
+
 def is_sync_in_progress() -> bool:
     """Check if a sync is currently running"""
     return _sync_in_progress
@@ -956,7 +972,8 @@ class EnhancedSyncEngine:
         
         try:
             _sync_in_progress = True
-            logger.info("Starting sync cycle...")
+            start_sync_timer()  # Start timeout tracking for Vercel
+            logger.info(f"Starting sync cycle... (timeout: {VERCEL_TIMEOUT_SECONDS}s)")
             
             # Reset diagnostics for this sync
             diagnostics = reset_diagnostics()
@@ -969,7 +986,8 @@ class EnhancedSyncEngine:
                 "contacts_to_wrike": {"processed": 0, "updated": 0, "failed": 0},
                 "issues_found": 0,
                 "end_time": None,
-                "duration_seconds": None
+                "duration_seconds": None,
+                "timeout_reached": False
             }
 
             start_time = utc_now()
@@ -988,6 +1006,11 @@ class EnhancedSyncEngine:
             results["companies_to_hubspot"].update(company_results)
             total_companies += company_results.get("processed", 0)
             total_changes += company_results.get("updated", 0) + company_results.get("created", 0)
+            
+            if is_timeout_approaching():
+                logger.warning("⏱ Timeout approaching after step 1, returning partial results")
+                results["timeout_reached"] = True
+                raise TimeoutError("Vercel timeout approaching")
 
             # 2. Wrike -> HubSpot (Contacts)
             logger.info("Syncing contacts from Wrike to HubSpot...")
@@ -995,12 +1018,22 @@ class EnhancedSyncEngine:
             results["contacts_to_hubspot"].update(contact_results)
             total_contacts += contact_results.get("processed", 0)
             total_changes += contact_results.get("updated", 0) + contact_results.get("created", 0)
+            
+            if is_timeout_approaching():
+                logger.warning("⏱ Timeout approaching after step 2, returning partial results")
+                results["timeout_reached"] = True
+                raise TimeoutError("Vercel timeout approaching")
 
             # 3. HubSpot -> Wrike (Companies)
             logger.info("Syncing companies from HubSpot to Wrike...")
             hubspot_company_results = self.sync_hubspot_to_wrike_companies(activity_id)
             results["companies_to_wrike"].update(hubspot_company_results)
             total_changes += hubspot_company_results.get("updated", 0)
+            
+            if is_timeout_approaching():
+                logger.warning("⏱ Timeout approaching after step 3, returning partial results")
+                results["timeout_reached"] = True
+                raise TimeoutError("Vercel timeout approaching")
 
             # 4. HubSpot -> Wrike (Contacts)
             if self.sync_opts.get("sync_contacts_hubspot_to_wrike", False):
@@ -1008,12 +1041,22 @@ class EnhancedSyncEngine:
                 hubspot_contact_results = self.sync_hubspot_to_wrike_contacts(activity_id)
                 results["contacts_to_wrike"].update(hubspot_contact_results)
                 total_changes += hubspot_contact_results.get("updated", 0)
+                
+                if is_timeout_approaching():
+                    logger.warning("⏱ Timeout approaching after step 4, returning partial results")
+                    results["timeout_reached"] = True
+                    raise TimeoutError("Vercel timeout approaching")
 
             # 5. Sync HubSpot Company Names to Wrike (auto-update "Hubspot Account Name" field)
             logger.info("Syncing HubSpot company names to Wrike...")
             name_sync_results = self.sync_hubspot_company_names_to_wrike(activity_id)
             results["company_names_synced"] = name_sync_results
             total_changes += name_sync_results.get("updated", 0)
+            
+            if is_timeout_approaching():
+                logger.warning("⏱ Timeout approaching after step 5, returning partial results")
+                results["timeout_reached"] = True
+                raise TimeoutError("Vercel timeout approaching")
 
             # 6. Sync HubSpot/Wrike IDs bidirectionally
             logger.info("Syncing HubSpot Account IDs and Wrike Client IDs...")
@@ -1076,6 +1119,33 @@ class EnhancedSyncEngine:
 
             return results
 
+        except TimeoutError as e:
+            # Graceful timeout - return partial results instead of failing
+            logger.warning(f"Sync timed out (partial results): {e}")
+            end_time = utc_now()
+            results["end_time"] = end_time.isoformat()
+            results["duration_seconds"] = (end_time - start_time).total_seconds()
+            results["status"] = "partial_timeout"
+            
+            self.db.complete_activity(
+                activity_id, 
+                companies=total_companies, 
+                contacts=total_contacts,
+                changes=total_changes, 
+                errors=total_errors,
+                summary=f"Partial (timeout): Companies: {total_companies}, Changes: {total_changes}"
+            )
+            self.db.log_sync_operation(
+                operation="full_sync",
+                source="middleware",
+                target="bidirectional",
+                entity_type="all",
+                entity_id=None,
+                status="partial_timeout",
+                message=f"Timeout after {results['duration_seconds']:.1f}s - partial sync completed"
+            )
+            return results
+            
         except Exception as e:
             logger.error(f"Sync failed: {e}")
             self.db.fail_activity(activity_id, str(e))
@@ -1103,10 +1173,30 @@ class EnhancedSyncEngine:
         end = utc_now()
 
         results = {"processed": 0, "created": 0, "updated": 0, "failed": 0, "sync_details": []}
+        
+        # Vercel timeout prevention
+        max_companies = 20 if IS_VERCEL else 1000
+        max_iterations = 100 if IS_VERCEL else 10000
+        iteration_count = 0
+        
+        logger.info(f"┌─ SYNC: Wrike → HubSpot Companies (max: {max_companies}, limit: {max_iterations} iterations)")
 
         for task in self.wrk.query_tasks_in_folder_updated_between(
             companies_folder, start, end, descendants=True
         ):
+            iteration_count += 1
+            
+            # Timeout and limit checks
+            if is_timeout_approaching():
+                logger.warning(f"│  ⏱ Timeout approaching at iteration {iteration_count}, stopping")
+                break
+            if iteration_count >= max_iterations:
+                logger.info(f"│  ⚠ Reached iteration limit of {max_iterations}")
+                break
+            if results["processed"] >= max_companies:
+                logger.info(f"│  ⚠ Reached limit of {max_companies} companies")
+                break
+                
             try:
                 wrike_task_id = safe_str(task.get("id"))
                 wrike_task_title = safe_str(task.get("title", ""))
@@ -1303,10 +1393,30 @@ class EnhancedSyncEngine:
         end = utc_now()
 
         results = {"processed": 0, "created": 0, "updated": 0, "failed": 0, "skipped_no_email": 0, "sync_details": []}
+        
+        # Vercel timeout prevention
+        max_contacts = 20 if IS_VERCEL else 1000
+        max_iterations = 200 if IS_VERCEL else 10000
+        iteration_count = 0
+        
+        logger.info(f"┌─ SYNC: Wrike → HubSpot Contacts (max: {max_contacts}, limit: {max_iterations} iterations)")
 
         for task in self.wrk.query_tasks_in_folder_updated_between(
             contacts_folder, start, end, descendants=True
         ):
+            iteration_count += 1
+            
+            # Timeout and limit checks
+            if is_timeout_approaching():
+                logger.warning(f"│  ⏱ Timeout approaching at iteration {iteration_count}, stopping")
+                break
+            if iteration_count >= max_iterations:
+                logger.info(f"│  ⚠ Reached iteration limit of {max_iterations}")
+                break
+            if results["processed"] >= max_contacts:
+                logger.info(f"│  ⚠ Reached limit of {max_contacts} contacts")
+                break
+                
             try:
                 wrike_task_id = safe_str(task.get("id"))
                 results["processed"] += 1
@@ -1419,11 +1529,20 @@ class EnhancedSyncEngine:
 
         results = {"processed": 0, "updated": 0, "failed": 0}
         
+        # Vercel timeout prevention
+        max_companies = 20 if IS_VERCEL else 100
+        logger.info(f"┌─ SYNC: HubSpot → Wrike Companies (max: {max_companies})")
+        
         # Search for updated companies in HubSpot
         filters = [{"filters": [{"propertyName": "hs_lastmodifieddate", "operator": "GTE", "value": to_epoch_ms(start)}]}]
-        search_results = self.hub.search_objects("companies", filters, properties=list(self.hp_company_props.values()), sorts=["hs_lastmodifieddate"], limit=100)
+        search_results = self.hub.search_objects("companies", filters, properties=list(self.hp_company_props.values()), sorts=["hs_lastmodifieddate"], limit=max_companies)
 
         for hub_company in search_results.get("results", []):
+            # Timeout check
+            if is_timeout_approaching():
+                logger.warning(f"│  ⏱ Timeout approaching, stopping at {results['processed']} companies")
+                break
+                
             try:
                 hub_id = hub_company["id"]
                 results["processed"] += 1
@@ -1540,9 +1659,12 @@ class EnhancedSyncEngine:
         
         # Use shorter lookback on Vercel to avoid timeout (7 days vs 365 days)
         lookback_days = 7 if IS_VERCEL else 365
-        max_companies = 50 if IS_VERCEL else 1000  # Limit on Vercel to avoid timeout
+        max_companies = 20 if IS_VERCEL else 1000  # Reduced to 20 for faster completion
+        max_iterations = 100 if IS_VERCEL else 10000  # Total tasks to iterate
         
-        logger.info(f"│  Lookback: {lookback_days} days, Max: {max_companies} companies")
+        logger.info(f"│  Lookback: {lookback_days} days, Max: {max_companies} AdminCards, Max iterations: {max_iterations}")
+        
+        iteration_count = 0
         
         # Get all tasks in the companies folder with descendants
         for task in self.wrk.query_tasks_in_folder_updated_between(
@@ -1551,7 +1673,19 @@ class EnhancedSyncEngine:
             utc_now(), 
             descendants=True
         ):
-            # Check if we've hit the limit (for Vercel timeout prevention)
+            iteration_count += 1
+            
+            # Check timeout FIRST
+            if is_timeout_approaching():
+                logger.warning(f"│  ⏱ Timeout approaching at iteration {iteration_count}, stopping")
+                break
+            
+            # Check iteration limit
+            if iteration_count >= max_iterations:
+                logger.info(f"│  ⚠ Reached iteration limit of {max_iterations}")
+                break
+            
+            # Check if we've hit the processed limit (for Vercel timeout prevention)
             if results["processed"] >= max_companies:
                 logger.info(f"│  ⚠ Reached limit of {max_companies} companies (Vercel timeout prevention)")
                 break
@@ -1710,9 +1844,12 @@ class EnhancedSyncEngine:
         
         # Use shorter lookback on Vercel to avoid timeout
         lookback_days = 7 if IS_VERCEL else 365
-        max_companies = 50 if IS_VERCEL else 1000
+        max_companies = 20 if IS_VERCEL else 1000  # Reduced to 20 for faster completion
+        max_iterations = 100 if IS_VERCEL else 10000  # Total tasks to iterate (including non-AdminCards)
         
-        logger.info(f"│  Lookback: {lookback_days} days, Max: {max_companies} companies")
+        logger.info(f"│  Lookback: {lookback_days} days, Max: {max_companies} AdminCards, Max iterations: {max_iterations}")
+        
+        iteration_count = 0
         
         # Get all tasks in the companies folder
         for task in self.wrk.query_tasks_in_folder_updated_between(
@@ -1721,7 +1858,19 @@ class EnhancedSyncEngine:
             utc_now(),
             descendants=True
         ):
-            # Check if we've hit the limit (for Vercel timeout prevention)
+            iteration_count += 1
+            
+            # Check timeout FIRST
+            if is_timeout_approaching():
+                logger.warning(f"│  ⏱ Timeout approaching at iteration {iteration_count}, stopping")
+                break
+            
+            # Check iteration limit (prevents iterating through thousands of non-AdminCard tasks)
+            if iteration_count >= max_iterations:
+                logger.info(f"│  ⚠ Reached iteration limit of {max_iterations}")
+                break
+            
+            # Check if we've hit the processed limit (for Vercel timeout prevention)
             if results["processed"] >= max_companies:
                 logger.info(f"│  ⚠ Reached limit of {max_companies} companies (Vercel timeout prevention)")
                 break
