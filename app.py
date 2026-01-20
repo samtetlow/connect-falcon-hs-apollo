@@ -1160,6 +1160,258 @@ async def cron_full_sync(authorization: Optional[str] = Header(None)):
         logger.error(f"Cron full sync failed: {e}")
         return {"status": "error", "message": str(e)}
 
+# ============================================
+# STEP-BY-STEP SYNC CRON ENDPOINTS
+# Each step runs separately to stay within Vercel's 10-second timeout
+# Schedule: Every 3 days, 10 minutes apart starting at 2:00 AM UTC
+# ============================================
+
+def verify_cron_auth(authorization: Optional[str]) -> bool:
+    """Verify cron request authorization"""
+    cron_secret = os.environ.get('CRON_SECRET')
+    if cron_secret and authorization != f"Bearer {cron_secret}":
+        return False
+    return True
+
+@app.get("/api/cron/sync-step-1")
+async def cron_sync_step_1(authorization: Optional[str] = Header(None)):
+    """
+    Step 1: Sync companies from Wrike to HubSpot.
+    Schedule: 0 2 */3 * * (Every 3 days at 2:00 AM UTC)
+    """
+    global sync_engine
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-1")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 1: Wrike → HubSpot Companies...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_wrike_to_hubspot_companies()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 1 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 1,
+            "description": "Wrike → HubSpot Companies",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-1 failed: {e}")
+        return {"status": "error", "step": 1, "message": str(e)}
+
+@app.get("/api/cron/sync-step-2")
+async def cron_sync_step_2(authorization: Optional[str] = Header(None)):
+    """
+    Step 2: Sync contacts from Wrike to HubSpot.
+    Schedule: 10 2 */3 * * (Every 3 days at 2:10 AM UTC)
+    """
+    global sync_engine
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-2")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 2: Wrike → HubSpot Contacts...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_wrike_to_hubspot_contacts()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 2 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 2,
+            "description": "Wrike → HubSpot Contacts",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-2 failed: {e}")
+        return {"status": "error", "step": 2, "message": str(e)}
+
+@app.get("/api/cron/sync-step-3")
+async def cron_sync_step_3(authorization: Optional[str] = Header(None)):
+    """
+    Step 3: Sync companies from HubSpot to Wrike.
+    Schedule: 20 2 */3 * * (Every 3 days at 2:20 AM UTC)
+    """
+    global sync_engine
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-3")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 3: HubSpot → Wrike Companies...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_hubspot_to_wrike_companies()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 3 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 3,
+            "description": "HubSpot → Wrike Companies",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-3 failed: {e}")
+        return {"status": "error", "step": 3, "message": str(e)}
+
+@app.get("/api/cron/sync-step-4")
+async def cron_sync_step_4(authorization: Optional[str] = Header(None)):
+    """
+    Step 4: Sync contacts from HubSpot to Wrike (if enabled in config).
+    Schedule: 30 2 */3 * * (Every 3 days at 2:30 AM UTC)
+    """
+    global sync_engine, sync_config
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-4")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    # Check if this sync direction is enabled
+    sync_opts = sync_config.get("sync", {}) if sync_config else {}
+    if not sync_opts.get("sync_contacts_hubspot_to_wrike", False):
+        logger.info("Step 4 skipped: sync_contacts_hubspot_to_wrike is disabled")
+        return {
+            "status": "skipped",
+            "step": 4,
+            "description": "HubSpot → Wrike Contacts",
+            "message": "Disabled in config (sync_contacts_hubspot_to_wrike: false)"
+        }
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 4: HubSpot → Wrike Contacts...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_hubspot_to_wrike_contacts()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 4 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 4,
+            "description": "HubSpot → Wrike Contacts",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-4 failed: {e}")
+        return {"status": "error", "step": 4, "message": str(e)}
+
+@app.get("/api/cron/sync-step-5")
+async def cron_sync_step_5(authorization: Optional[str] = Header(None)):
+    """
+    Step 5: Sync HubSpot company names to Wrike.
+    Schedule: 40 2 */3 * * (Every 3 days at 2:40 AM UTC)
+    """
+    global sync_engine
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-5")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 5: HubSpot Company Names → Wrike...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_hubspot_company_names_to_wrike()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 5 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 5,
+            "description": "HubSpot Company Names → Wrike",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-5 failed: {e}")
+        return {"status": "error", "step": 5, "message": str(e)}
+
+@app.get("/api/cron/sync-step-6")
+async def cron_sync_step_6(authorization: Optional[str] = Header(None)):
+    """
+    Step 6: Sync HubSpot/Wrike IDs bidirectionally.
+    Schedule: 50 2 */3 * * (Every 3 days at 2:50 AM UTC)
+    """
+    global sync_engine
+    
+    if not verify_cron_auth(authorization):
+        logger.warning("Unauthorized cron request for sync-step-6")
+        return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not sync_engine:
+        return {"status": "error", "message": "Sync Engine not configured"}
+    
+    try:
+        from sync_engine import start_sync_timer
+        start_sync_timer()
+        
+        logger.info("🔄 Cron Step 6: HubSpot/Wrike IDs Bidirectional...")
+        import time
+        start = time.time()
+        
+        results = sync_engine.sync_company_ids_bidirectional()
+        duration = time.time() - start
+        
+        logger.info(f"✓ Step 6 complete in {duration:.1f}s: {results.get('processed', 0)} processed")
+        return {
+            "status": "success",
+            "step": 6,
+            "description": "HubSpot/Wrike IDs Bidirectional",
+            "duration_seconds": round(duration, 2),
+            "results": results
+        }
+    except Exception as e:
+        logger.error(f"Cron sync-step-6 failed: {e}")
+        return {"status": "error", "step": 6, "message": str(e)}
+
 # Create a simple startup script
 def start_server():
     """Start the server manually"""

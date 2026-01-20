@@ -12,8 +12,28 @@
       "schedule": "0 14 * * *"
     },
     {
-      "path": "/api/cron/full-sync",
+      "path": "/api/cron/sync-step-1",
       "schedule": "0 2 */3 * *"
+    },
+    {
+      "path": "/api/cron/sync-step-2",
+      "schedule": "10 2 */3 * *"
+    },
+    {
+      "path": "/api/cron/sync-step-3",
+      "schedule": "20 2 */3 * *"
+    },
+    {
+      "path": "/api/cron/sync-step-4",
+      "schedule": "30 2 */3 * *"
+    },
+    {
+      "path": "/api/cron/sync-step-5",
+      "schedule": "40 2 */3 * *"
+    },
+    {
+      "path": "/api/cron/sync-step-6",
+      "schedule": "50 2 */3 * *"
     }
   ]
 }
