@@ -1875,12 +1875,19 @@
             // Update scheduler status
             const statusEl = document.getElementById('scheduler-status');
             if (statusEl) {
-                if (scheduler.running && scheduler.enabled) {
-                    statusEl.innerHTML = '<span class="status-dot status-dot-success"></span> Running';
+                // On Vercel (cron mode), scheduler.running is always false
+                // Check if it's active based on mode and enabled status
+                const isVercelCron = scheduler.mode === 'vercel_cron';
+                const isActive = isVercelCron ? scheduler.enabled : (scheduler.running && scheduler.enabled);
+                const isPaused = isVercelCron ? !scheduler.enabled : (scheduler.running && !scheduler.enabled);
+                
+                if (isActive) {
+                    const statusText = isVercelCron ? 'Active (Cron)' : 'Running';
+                    statusEl.innerHTML = `<span class="status-dot status-dot-success"></span> ${statusText}`;
                     statusEl.classList.remove('status-warning', 'status-error');
                     statusEl.classList.add('status-success');
                     schedulerRunning = true;
-                } else if (scheduler.running && !scheduler.enabled) {
+                } else if (isPaused) {
                     statusEl.innerHTML = '<span class="status-dot status-dot-warning"></span> Paused';
                     statusEl.classList.remove('status-success', 'status-error');
                     statusEl.classList.add('status-warning');
