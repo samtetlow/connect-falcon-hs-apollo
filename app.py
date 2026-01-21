@@ -66,7 +66,7 @@ sync_config = None  # Configuration loaded from config.yaml
 
 # Scheduler state tracking
 scheduler_state = {
-    "enabled": False,
+    "enabled": IS_VERCEL,  # Enabled by default on Vercel (cron jobs), disabled until APScheduler starts locally
     "mode": "vercel_cron" if IS_VERCEL else "apscheduler",
     "change_detection_interval_minutes": 2,
     "reconciliation_hour": 0,
@@ -860,7 +860,14 @@ async def get_scheduler_status():
 @app.post("/api/scheduler/pause")
 async def pause_scheduler():
     """Pause the background scheduler"""
-    global scheduler
+    global scheduler, scheduler_state
+    
+    # On Vercel, we use cron jobs - just update the state flag
+    if IS_VERCEL:
+        scheduler_state["enabled"] = False
+        logger.info("⏸ Scheduler paused (Vercel cron jobs will skip when disabled)")
+        return {"status": "success", "message": "Auto-sync paused (cron jobs will skip)"}
+    
     if not scheduler:
         return {"status": "error", "message": "Scheduler not available"}
     
@@ -875,7 +882,15 @@ async def pause_scheduler():
 @app.post("/api/scheduler/resume")
 async def resume_scheduler():
     """Resume the background scheduler"""
-    global scheduler
+    global scheduler, scheduler_state
+    
+    # On Vercel, we use cron jobs - just update the state flag
+    if IS_VERCEL:
+        scheduler_state["enabled"] = True
+        update_scheduler_next_runs()
+        logger.info("▶ Scheduler resumed (Vercel cron jobs will run when triggered)")
+        return {"status": "success", "message": "Auto-sync resumed (cron jobs active)"}
+    
     if not scheduler:
         return {"status": "error", "message": "Scheduler not available"}
     
@@ -1063,6 +1078,11 @@ async def cron_change_detection(authorization: Optional[str] = Header(None)):
             content={"status": "error", "message": "Unauthorized"}
         )
     
+    # Check if scheduler is paused
+    if not is_scheduler_enabled():
+        logger.info("Cron change-detection skipped: scheduler is paused")
+        return {"status": "skipped", "message": "Scheduler is paused"}
+    
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
@@ -1098,6 +1118,11 @@ async def cron_reconciliation(authorization: Optional[str] = Header(None)):
             status_code=401,
             content={"status": "error", "message": "Unauthorized"}
         )
+    
+    # Check if scheduler is paused
+    if not is_scheduler_enabled():
+        logger.info("Cron reconciliation skipped: scheduler is paused")
+        return {"status": "skipped", "message": "Scheduler is paused"}
     
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
@@ -1141,6 +1166,11 @@ async def cron_full_sync(authorization: Optional[str] = Header(None)):
             content={"status": "error", "message": "Unauthorized"}
         )
     
+    # Check if scheduler is paused
+    if not is_scheduler_enabled():
+        logger.info("Cron full-sync skipped: scheduler is paused")
+        return {"status": "skipped", "message": "Scheduler is paused"}
+    
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
@@ -1173,6 +1203,10 @@ def verify_cron_auth(authorization: Optional[str]) -> bool:
         return False
     return True
 
+def is_scheduler_enabled() -> bool:
+    """Check if scheduler/cron is enabled"""
+    return scheduler_state.get("enabled", False)
+
 @app.get("/api/cron/sync-step-1")
 async def cron_sync_step_1(authorization: Optional[str] = Header(None)):
     """
@@ -1184,6 +1218,9 @@ async def cron_sync_step_1(authorization: Optional[str] = Header(None)):
     if not verify_cron_auth(authorization):
         logger.warning("Unauthorized cron request for sync-step-1")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
     
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
@@ -1223,6 +1260,9 @@ async def cron_sync_step_2(authorization: Optional[str] = Header(None)):
         logger.warning("Unauthorized cron request for sync-step-2")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
     
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
+    
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
@@ -1261,6 +1301,9 @@ async def cron_sync_step_3(authorization: Optional[str] = Header(None)):
         logger.warning("Unauthorized cron request for sync-step-3")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
     
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
+    
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
@@ -1298,6 +1341,9 @@ async def cron_sync_step_4(authorization: Optional[str] = Header(None)):
     if not verify_cron_auth(authorization):
         logger.warning("Unauthorized cron request for sync-step-4")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
     
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
@@ -1348,6 +1394,9 @@ async def cron_sync_step_5(authorization: Optional[str] = Header(None)):
         logger.warning("Unauthorized cron request for sync-step-5")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
     
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
+    
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
     
@@ -1385,6 +1434,9 @@ async def cron_sync_step_6(authorization: Optional[str] = Header(None)):
     if not verify_cron_auth(authorization):
         logger.warning("Unauthorized cron request for sync-step-6")
         return JSONResponse(status_code=401, content={"status": "error", "message": "Unauthorized"})
+    
+    if not is_scheduler_enabled():
+        return {"status": "skipped", "message": "Scheduler is paused"}
     
     if not sync_engine:
         return {"status": "error", "message": "Sync Engine not configured"}
